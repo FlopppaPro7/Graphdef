@@ -7,6 +7,8 @@
   #controls { margin: 6px 0; }
   #controls button { font-family: monospace; margin-right: 4px; padding: 3px 6px; }
   #controls button.sel { outline: 2px solid #000; }
+  #selpanel { margin: 4px 0; }
+  #selpanel button { font-family: monospace; margin-left: 4px; }
   #eq { width: 60vw; max-width: 360px; font-family: monospace; padding: 2px; }
   #pellets { width: 40px; font-family: monospace; }
   #cost { font-weight: bold; }
@@ -41,12 +43,19 @@
   <button id="wave">Start Wave</button>
 </div>
 
+<div id="selpanel">
+  <span id="selinfo">Selected: none — click a placed turret to select it.</span>
+  <button id="upgrade" disabled>Upgrade</button>
+  <button id="sell" disabled>Sell</button>
+</div>
+
 <div id="meta" class="hint">metadata: --</div>
 <div class="hint">
   Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Bullets ride the curve <b>rightward</b> from the turret, so place turrets to the LEFT of the incoming lane.
   Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
   Path speed (arc-length/sec): Railgun 20 (rides f'(x), pierce 3) · Sniper 16 (pierces all) · Mirror 11 (twin ±f) · Shotgun 9 (short) · Bazooka 6.5 (splash) · Mortar 5 (area blast) · Subwoofer 3.5 (slow wave).
   <b>Curviness tax:</b> bullets ride the curve at path speed, so wavy shots travel longer AND lose damage with excess arc length — a straight shot keeps full punch; spamming <code>sin</code> hits softer. (Splash towers are exempt.)
+  <b>Upgrades:</b> click a placed turret to select it, then Upgrade (a unique mechanic, not a stat buff) or Sell (60% refund). Upgraded turrets show a <code>*</code>.
   Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
 </div>
 
@@ -347,13 +356,26 @@ const G = {
   towers: [],
   creeps: [],
   bullets: [],  // every shot is a real projectile riding the curve
+  zones: [],    // lingering damage puddles (Napalm mortar upgrade)
   fx: [],       // explosions / floating text
   selType: 'sniper',
   placing: false,
+  selectedTower: null, // placed turret picked for upgrade / sell
   waveActive: false,
   spawnQueue: [],
   spawnTimer: 0,
   over: false,
+};
+
+// Unique, mechanic-changing evolution per archetype (NOT a stat buff).
+const UPGRADES = {
+  sniper:    { name: 'Armor-Piercing',    cost: 130, desc: 'Ignores Tangent/Phase/Boss immunity (Root Bug still needs y=0).' },
+  bazooka:   { name: 'Cluster Munition',  cost: 140, desc: 'Detonation spawns two side bomblet blasts.' },
+  shotgun:   { name: 'Focus Choke',       cost: 120, desc: 'Pellets converge to a single focal point at range end.' },
+  subwoofer: { name: 'Resonance',         cost: 120, desc: 'Struck creeps turn Vulnerable: +50% damage from all sources.' },
+  mirror:    { name: 'Boomerang',         cost: 130, desc: 'Bullets reverse at max range and sweep back through creeps.' },
+  mortar:    { name: 'Napalm',            cost: 150, desc: 'Blast leaves a burning zone dealing damage over time.' },
+  railgun:   { name: "Second Derivative", cost: 150, desc: "Rides f''(x) (concavity) with infinite pierce." },
 };
 
 // Every archetype now fires REAL bullets that ride the typed curve rightward.
@@ -377,10 +399,11 @@ function derivOf(fn) {
   const h = 0.008;
   return (t) => (fn(t + h) - fn(t - h)) / (2 * h);
 }
-// Curviness damage tax: straight shots keep full damage at any range;
-// only the arc length spent bending (excess over horizontal distance) is taxed.
+// Curviness damage tax: straight shots keep full damage at any range (and any
+// direction, so Boomerang returns aren't punished); only the arc length spent
+// BENDING is taxed -- excess of path length over horizontal distance travelled.
 function arcTax(b) {
-  const excess = Math.max(0, b.arc - (b.x - b.startX));
+  const excess = Math.max(0, b.arc - b.horiz);
   return Math.max(ARC_FLOOR, 1 - excess * ARC_TAX);
 }
 
@@ -406,21 +429,24 @@ function makeCreep(kind, wave) {
 
 // Damage eligibility: can `meta` (the firing equation) hurt this creep at hitY?
 // Returns a damage multiplier (0 = immune).
-function eligibility(creep, meta, hitY) {
+// bypass = Armor-Piercing (Sniper upgrade): waives immunity gates, but the
+// Root Bug's positional y=0 rule is physics, not immunity, so it always holds.
+function eligibility(creep, meta, hitY, bypass) {
   switch (creep.kind) {
     case 'tangent':
       // needs a non-linear curve (degree>1 OR any function)
-      return meta.isLinear ? 0 : 1;
+      return (bypass || !meta.isLinear) ? 1 : 0;
     case 'root':
       // only damaged when the contact point is near the x-axis (y = 0)
       return (Number.isFinite(hitY) && Math.abs(hitY) < 0.18) ? 1.4 : 0;
     case 'phase':
       // needs sin or cos; bonus when the exact phase (sin/cos) matches
+      if (bypass) return 1;
       if (!meta.hasTrig) return 0;
       return meta.funcs[creep.phase] ? 1.5 : 1;
     case 'boss':
       // immune to simple linear; needs degree>2 OR exp/log/abs
-      return (meta.degree > 2 || meta.hasExpLogAbs) ? 1 : 0;
+      return (bypass || meta.degree > 2 || meta.hasExpLogAbs) ? 1 : 0;
     default:
       return 1; // basic / runner / tank
   }
@@ -435,13 +461,17 @@ function log(msg) {
    7. FIRING
 --------------------------------------------------------------------------- */
 function damageCreep(creep, dmg, srcMeta) {
-  creep.hp -= dmg;
+  const vuln = creep.vulnT > 0 ? 1.5 : 1; // Resonance debuff amplifies ALL sources
+  creep.hp -= dmg * vuln;
   if (creep.hp <= 0) creep._dead = true;
 }
 
 // World-Y of a bullet at world-x (flip = +1 normal, -1 for Mirror Mage).
+// Focus Choke: pellet offset shrinks to 0 by range end so pellets converge.
 function bulletY(b, x) {
-  return b.wy + b.flip * b.fn(x - b.wx) + b.offset;
+  let off = b.offset;
+  if (b.converge && b.convRange > 0) off *= Math.max(0, 1 - (x - b.startX) / b.convRange);
+  return b.wy + b.flip * b.fn(x - b.wx) + off;
 }
 
 // Numeric area under |f| over the firing window (drives Integral Mortar).
@@ -457,15 +487,23 @@ function curveArea(fn, range) {
 function spawnBullet(tw, opt) {
   opt = opt || {};
   const def = TOWER_DEF[tw.type];
+  const up = !!tw.upg;
+  // choose the path function: Railgun rides f'(x); its upgrade rides f''(x)
+  let fn = def.deriv ? derivOf(tw.fn) : tw.fn;
+  if (up && tw.type === 'railgun') fn = derivOf(derivOf(tw.fn));
+  const pierce = (up && tw.type === 'railgun') ? 1e9 : (def.pierce || 1);
   G.bullets.push({
-    tw, def, meta: tw.meta,
-    fn: def.deriv ? derivOf(tw.fn) : tw.fn, // Railgun rides f'(x)
+    tw, def, meta: tw.meta, fn,
     wx: tw.wx, wy: tw.wy,
     flip: opt.flip || 1,
     offset: opt.offset || 0,
     x: tw.wx,
     startX: tw.wx,          // for the arc-length (curviness) tax
+    minX: tw.wx,            // Boomerang return limit
+    dir: 1,                 // +1 outbound, flips to -1 on a Boomerang bounce
+    bounced: false,
     arc: 0,                 // path length travelled so far
+    horiz: 0,               // horizontal distance travelled (|dx| summed)
     age: 0,                 // seconds in flight
     speed: def.speed,       // now interpreted as PATH speed (arc-units / sec)
     maxX: tw.wx + def.range,
@@ -474,8 +512,16 @@ function spawnBullet(tw, opt) {
     slow: def.slow || 0,
     behavior: def.behavior,
     taxed: def.behavior !== 'explode', // explosives keep full damage (mortar area)
-    pierceLeft: def.pierce || 1,
+    pierceLeft: pierce,
     hitSet: new Set(),      // creeps this bullet already damaged (no double-hit)
+    // --- unique upgrade flags ---
+    bypass:    up && tw.type === 'sniper',
+    converge:  up && tw.type === 'shotgun',
+    convRange: def.range,
+    boomerang: up && tw.type === 'mirror',
+    cluster:   up && tw.type === 'bazooka',
+    napalm:    up && tw.type === 'mortar',
+    resonance: up && tw.type === 'subwoofer',
     ttl: 5.0,
     y: tw.wy,
     dead: false,
@@ -503,17 +549,30 @@ function fireTower(tw) {
   }
 }
 
-function detonate(sx, sy, meta, def) {
-  G.fx.push({ x: sx, y: sy, r: 0.1, max: def.splash, ttl: 0.35, kind: 'boom' });
+// One explosive blast: splash damage with distance falloff.
+function blast(sx, sy, splash, dmg, meta) {
+  G.fx.push({ x: sx, y: sy, r: 0.1, max: splash, ttl: 0.35, kind: 'boom' });
   for (const c of G.creeps) {
+    if (c._dead) continue;
     const d = Math.hypot(c.x - sx, c.y - sy);
-    if (d < def.splash + c.r) {
+    if (d < splash + c.r) {
       const mult = eligibility(c, meta, sy); // contact y = detonation y
       if (mult > 0) {
-        const falloff = 1 - d / (def.splash + c.r);
-        damageCreep(c, def.dmg * Math.max(0.35, falloff) * mult, meta);
+        const falloff = 1 - d / (splash + c.r);
+        damageCreep(c, dmg * Math.max(0.35, falloff) * mult, meta);
       }
     }
+  }
+}
+// Detonate a shell. o = { splash, dmg, cluster, napalm }.
+function detonate(sx, sy, meta, o) {
+  blast(sx, sy, o.splash, o.dmg, meta);
+  if (o.cluster) { // Cluster Munition: two side bomblets
+    blast(sx - 0.9, sy, o.splash * 0.7, o.dmg * 0.6, meta);
+    blast(sx + 0.9, sy, o.splash * 0.7, o.dmg * 0.6, meta);
+  }
+  if (o.napalm) {  // Napalm: leave a burning zone (damage over time)
+    G.zones.push({ x: sx, y: sy, r: o.splash * 1.15, ttl: 3.0, dps: o.dmg * 0.85, meta });
   }
 }
 
@@ -533,32 +592,41 @@ function updateBullets(dt) {
       let slope = (bulletY(b, b.x + hh) - bulletY(b, b.x - hh)) / (2 * hh);
       if (!Number.isFinite(slope)) slope = 0;
       const s2 = Math.min(slope * slope, 25); // cap so steep curves crawl, not stall
-      b.x += ds / Math.sqrt(1 + s2);
+      const dx = b.dir * ds / Math.sqrt(1 + s2);
+      b.x += dx;
       b.arc += ds;
+      b.horiz += Math.abs(dx);
       remaining -= ds;
       const y = bulletY(b, b.x);
       b.y = y;
-      // reached range / off-grid / undefined curve -> stop (explode if a shell)
-      if (!Number.isFinite(y) || b.x >= b.maxX || b.x > XMAX + 0.5) {
-        if (b.behavior === 'explode' && Number.isFinite(y)) {
-          detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg });
+      // reached range / off-grid / undefined curve
+      const atEnd = b.dir > 0 ? (b.x >= b.maxX || b.x > XMAX + 0.5)
+                              : (b.x <= b.minX || b.x < XMIN - 0.5);
+      if (!Number.isFinite(y) || atEnd) {
+        if (b.boomerang && !b.bounced && b.dir > 0 && Number.isFinite(y)) {
+          b.dir = -1; b.bounced = true; b.hitSet.clear(); // sweep back, can re-hit
+        } else {
+          if (b.behavior === 'explode' && Number.isFinite(y)) {
+            detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg, cluster: b.cluster, napalm: b.napalm });
+          }
+          b.dead = true; break;
         }
-        b.dead = true; break;
       }
       // collision sweep against creeps
       for (const c of G.creeps) {
         if (c._dead) continue;
         if (Math.hypot(c.x - b.x, c.y - y) < c.r + HIT_R) {
           if (b.behavior === 'explode') {
-            detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg });
+            detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg, cluster: b.cluster, napalm: b.napalm });
             b.dead = true; break;
           }
-          if (b.hitSet.has(c)) continue;             // already damaged by this bullet
-          const mult = eligibility(c, b.meta, y);    // y = contact height (Root Bug rule)
+          if (b.hitSet.has(c)) continue;                     // already damaged by this bullet
+          const mult = eligibility(c, b.meta, y, b.bypass);  // y = contact height (Root Bug rule)
           if (mult > 0) {
             const tax = b.taxed ? arcTax(b) : 1;     // curvy paths hit softer
             damageCreep(c, b.dmg * mult * tax, b.meta);
             if (b.slow > 0) c.slowT = 0.3;
+            if (b.resonance) c.vulnT = 1.2;          // mark Vulnerable
             b.hitSet.add(c);
             if (--b.pierceLeft <= 0) { b.dead = true; break; }
           }
@@ -595,6 +663,7 @@ function update(dt) {
     c.t += dt;
     const slowMul = c.slowT > 0 ? 0.45 : 1;
     if (c.slowT > 0) c.slowT -= dt;
+    if (c.vulnT > 0) c.vulnT -= dt; // Resonance debuff fades
     c.x -= c.speed * slowMul * dt;
     // per-kind vertical behavior
     if (c.kind === 'tangent') {
@@ -620,6 +689,19 @@ function update(dt) {
 
   // --- bullets (all archetypes). Substepped sweep so fast rounds can't tunnel.
   updateBullets(dt);
+
+  // --- burning zones (Napalm): tick damage to creeps inside, then decay
+  for (const z of G.zones) {
+    z.ttl -= dt;
+    for (const c of G.creeps) {
+      if (c._dead) continue;
+      if (Math.hypot(c.x - z.x, c.y - z.y) < z.r + c.r) {
+        const mult = eligibility(c, z.meta, z.y);
+        if (mult > 0) damageCreep(c, z.dps * mult * dt, z.meta);
+      }
+    }
+  }
+  G.zones = G.zones.filter(z => z.ttl > 0);
 
   // --- resolve dead creeps
   for (const c of G.creeps) {
@@ -696,6 +778,13 @@ function drawCurve(fn, wx0, wy0, color, offset, alpha, xlo, xhi) {
 function render() {
   drawGrid();
 
+  // burning zones (Napalm)
+  for (const z of G.zones) {
+    const p = worldToCanvas(z.x, z.y);
+    ctx.fillStyle = 'rgba(220,90,0,' + (0.28 * Math.min(1, z.ttl / 3)) + ')';
+    ctx.beginPath(); ctx.arc(p.px, p.py, z.r * PXU, 0, 7); ctx.fill();
+  }
+
   // bullets: faint curve trace from muzzle to the bullet head, then the head.
   for (const b of G.bullets) {
     const traceFn = (t) => b.flip * b.fn(t);
@@ -726,10 +815,18 @@ function render() {
   for (const tw of G.towers) {
     const p = worldToCanvas(tw.wx, tw.wy);
     const def = TOWER_DEF[tw.type];
+    if (tw === G.selectedTower) { // selection halo + its firing curve
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+      ctx.strokeRect(p.px - 9, p.py - 9, 18, 18);
+      ctx.lineWidth = 1; drawCurve(tw.fn, tw.wx, tw.wy, def.color, 0, 0.5);
+    }
     ctx.fillStyle = def.color;
     ctx.fillRect(p.px - 6, p.py - 6, 12, 12);
+    if (tw.upg) { // upgraded marker: white star dot
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.px, p.py, 2.5, 0, 7); ctx.fill();
+    }
     ctx.fillStyle = '#000'; ctx.font = '9px monospace';
-    ctx.fillText(def.name.split(' ')[0], p.px - 6, p.py - 8);
+    ctx.fillText(def.name.split(' ')[0] + (tw.upg ? '*' : ''), p.px - 6, p.py - 10);
   }
 
   // creeps
@@ -738,6 +835,7 @@ function render() {
     ctx.fillStyle = c.col;
     ctx.beginPath(); ctx.arc(p.px, p.py, c.r * PXU, 0, 7); ctx.fill();
     if (c.slowT > 0) { ctx.strokeStyle = '#0af'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.px, p.py, c.r * PXU + 2, 0, 7); ctx.stroke(); ctx.lineWidth = 1; }
+    if (c.vulnT > 0) { ctx.strokeStyle = '#e00'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.px, p.py, c.r * PXU + 4, 0, 7); ctx.stroke(); ctx.lineWidth = 1; }
     // hp bar
     const w = 24, hpw = w * Math.max(0, c.hp / c.max);
     ctx.fillStyle = '#c00'; ctx.fillRect(p.px - w / 2, p.py - c.r * PXU - 8, w, 3);
@@ -847,10 +945,23 @@ canvas.addEventListener('mousemove', (e) => {
   G.mouse = { px: (e.clientX - rect.left) * (CW / rect.width), py: (e.clientY - rect.top) * (CH / rect.height) };
 });
 canvas.addEventListener('click', (e) => {
-  if (!G.placing) return;
   const rect = canvas.getBoundingClientRect();
   const px = (e.clientX - rect.left) * (CW / rect.width);
   const py = (e.clientY - rect.top) * (CH / rect.height);
+
+  // Not placing? A click selects the nearest placed turret (within ~16px).
+  if (!G.placing) {
+    let best = null, bestD = 16;
+    for (const tw of G.towers) {
+      const tp = worldToCanvas(tw.wx, tw.wy);
+      const d = Math.hypot(tp.px - px, tp.py - py);
+      if (d < bestD) { bestD = d; best = tw; }
+    }
+    G.selectedTower = best;
+    refreshSelPanel();
+    return;
+  }
+
   const w = canvasToWorld(px, py);
   const raw = document.getElementById('eq').value;
   const pel = parseInt(document.getElementById('pellets').value, 10) || 1;
@@ -869,6 +980,56 @@ canvas.addEventListener('click', (e) => {
   log("Placed " + TOWER_DEF[G.selType].name + " @ (" + w.x.toFixed(1) + "," + w.y.toFixed(1) + ") eq: y=" + raw.trim() + " cost " + r.cost + ".");
 });
 
+// --- selection / upgrade / sell panel ---
+const upgradeBtn = document.getElementById('upgrade');
+const sellBtn = document.getElementById('sell');
+const selInfo = document.getElementById('selinfo');
+
+function sellValue(tw) {
+  const base = computeCost(tw.eq, tw.type, tw.pellets).cost || 50;
+  const spent = base + (tw.upg ? UPGRADES[tw.type].cost : 0);
+  return Math.round(spent * 0.6); // 60% refund
+}
+function refreshSelPanel() {
+  const tw = G.selectedTower;
+  if (!tw) {
+    selInfo.textContent = 'Selected: none — click a placed turret to select it.';
+    upgradeBtn.disabled = true; sellBtn.disabled = true;
+    upgradeBtn.textContent = 'Upgrade'; sellBtn.textContent = 'Sell';
+    return;
+  }
+  const up = UPGRADES[tw.type];
+  const name = TOWER_DEF[tw.type].name;
+  if (tw.upg) {
+    selInfo.textContent = 'Selected: ' + name + ' [' + up.name + '] y=' + tw.eq + ' — ' + up.desc;
+    upgradeBtn.disabled = true; upgradeBtn.textContent = 'Upgraded';
+  } else {
+    selInfo.textContent = 'Selected: ' + name + ' y=' + tw.eq + '  →  ' + up.name + ' (' + up.cost + '): ' + up.desc;
+    upgradeBtn.disabled = false; upgradeBtn.textContent = 'Upgrade (' + up.cost + ')';
+  }
+  sellBtn.disabled = false; sellBtn.textContent = 'Sell (+' + sellValue(tw) + ')';
+}
+upgradeBtn.addEventListener('click', () => {
+  const tw = G.selectedTower;
+  if (!tw || tw.upg) return;
+  const up = UPGRADES[tw.type];
+  if (G.energy < up.cost) { log("Not enough energy for " + up.name + " (" + up.cost + " needed)."); return; }
+  G.energy -= up.cost;
+  tw.upg = true;
+  log(TOWER_DEF[tw.type].name + " evolved: " + up.name + " — " + up.desc);
+  refreshSelPanel();
+});
+sellBtn.addEventListener('click', () => {
+  const tw = G.selectedTower;
+  if (!tw) return;
+  const refund = sellValue(tw);
+  G.energy += refund;
+  G.towers = G.towers.filter(t => t !== tw);
+  G.selectedTower = null;
+  log("Sold " + TOWER_DEF[tw.type].name + " for +" + refund + " energy.");
+  refreshSelPanel();
+});
+
 /* ---------------------------------------------------------------------------
    12. MAIN LOOP
 --------------------------------------------------------------------------- */
@@ -883,6 +1044,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 refreshCostPreview();
+refreshSelPanel();
 log("Welcome to Graphwar Tower Defense. Place turrets by typing y=f(x), then Start Wave.");
 requestAnimationFrame(frame);
 </script>
