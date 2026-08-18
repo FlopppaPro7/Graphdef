@@ -31,6 +31,8 @@
   <button id="t-bazooka" class="ttype" data-t="bazooka">Bazooka Dude</button>
   <button id="t-shotgun" class="ttype" data-t="shotgun">Shotgun Guy</button>
   <button id="t-subwoofer" class="ttype" data-t="subwoofer">Subwoofer DJ</button>
+  <button id="t-mirror" class="ttype" data-t="mirror">Mirror Mage</button>
+  <button id="t-mortar" class="ttype" data-t="mortar">Integral Mortar</button>
   &nbsp;|&nbsp;
   y = <input id="eq" type="text" value="0*x + 2" spellcheck="false">
   pellets(N)= <input id="pellets" type="number" value="5" min="1" max="12">
@@ -40,8 +42,9 @@
 
 <div id="meta" class="hint">metadata: --</div>
 <div class="hint">
-  Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Equation is relative to the turret (curve passes through it).
+  Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Bullets ride the curve <b>rightward</b> from the turret, so place turrets to the LEFT of the incoming lane.
   Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
+  Speed bands: Sniper 16 (pierces all) · Mirror 11 (twin ±f, pierce 2) · Shotgun 9 (short) · Bazooka 6.5 (splash) · Mortar 5 (area-scaled blast) · Subwoofer 3.5 (slow wave, pierces all).
   Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
 </div>
 
@@ -267,7 +270,7 @@ function compileEquation(raw) {
 --------------------------------------------------------------------------- */
 function pelletCountFor(type, pelletsInput) {
   if (type === 'shotgun') return Math.max(1, Math.min(12, pelletsInput | 0));
-  return 1; // sniper/bazooka/subwoofer fire a single trajectory/field
+  return 1; // all other archetypes price as a single trajectory
 }
 function computeCost(raw, type, pelletsInput) {
   const c = compileEquation(raw);
@@ -341,8 +344,7 @@ const G = {
   wave: 0,
   towers: [],
   creeps: [],
-  shells: [],   // bazooka projectiles
-  beams: [],    // transient visual beams
+  bullets: [],  // every shot is a real projectile riding the curve
   fx: [],       // explosions / floating text
   selType: 'sniper',
   placing: false,
@@ -352,14 +354,18 @@ const G = {
   over: false,
 };
 
+// Every archetype now fires REAL bullets that ride the typed curve rightward.
+// Each has its own speed band (world units / sec along x).
 const TOWER_DEF = {
-  sniper:    { name: 'Sniper Pro',   cd: 0.85, dmg: 6.5, color: '#0a5', thr: 0.22 },
-  bazooka:   { name: 'Bazooka Dude', cd: 2.4,  dmg: 16,  color: '#a40', thr: 0.22, splash: 1.3 },
-  shotgun:   { name: 'Shotgun Guy',  cd: 1.2,  dmg: 3.4, color: '#508', thr: 0.20, spread: 0.35, range: 8 },
-  subwoofer: { name: 'Subwoofer DJ', cd: 0.10, dmg: 0.9, color: '#059', thr: 0.30, slow: 0.5 },
+  sniper:    { name: 'Sniper Pro',     cd: 0.85, dmg: 6.5, color: '#0a5', speed: 16,  range: 20, behavior: 'pierce',  pierce: 99 },
+  bazooka:   { name: 'Bazooka Dude',   cd: 2.4,  dmg: 16,  color: '#a40', speed: 6.5, range: 14, behavior: 'explode', splash: 1.3 },
+  shotgun:   { name: 'Shotgun Guy',    cd: 1.2,  dmg: 3.4, color: '#508', speed: 9,   range: 7,  behavior: 'pierce',  pierce: 1, spread: 0.35 },
+  subwoofer: { name: 'Subwoofer DJ',   cd: 0.55, dmg: 1.7, color: '#059', speed: 3.5, range: 20, behavior: 'field',   pierce: 1e9, slow: 0.5 },
+  mirror:    { name: 'Mirror Mage',    cd: 1.0,  dmg: 5.0, color: '#c09', speed: 11,  range: 20, behavior: 'pierce',  pierce: 2 },
+  mortar:    { name: 'Integral Mortar',cd: 2.8,  dmg: 11,  color: '#680', speed: 5,   range: 12, behavior: 'explode', splash: 1.0 },
 };
 
-const HIT_THRESHOLD = 0.24; // world units baseline
+const HIT_R = 0.16; // extra bullet contact radius (world units)
 
 /* ---------------------------------------------------------------------------
    6. ENEMIES
@@ -416,59 +422,61 @@ function damageCreep(creep, dmg, srcMeta) {
   if (creep.hp <= 0) creep._dead = true;
 }
 
+// World-Y of a bullet at world-x (flip = +1 normal, -1 for Mirror Mage).
+function bulletY(b, x) {
+  return b.wy + b.flip * b.fn(x - b.wx) + b.offset;
+}
+
+// Numeric area under |f| over the firing window (drives Integral Mortar).
+function curveArea(fn, range) {
+  let a = 0;
+  for (let t = 0; t < range; t += 0.05) {
+    const v = fn(t);
+    if (Number.isFinite(v)) a += Math.min(6, Math.abs(v)) * 0.05; // clamp wild spikes
+  }
+  return a;
+}
+
+function spawnBullet(tw, opt) {
+  opt = opt || {};
+  const def = TOWER_DEF[tw.type];
+  G.bullets.push({
+    tw, def, meta: tw.meta, fn: tw.fn, wx: tw.wx, wy: tw.wy,
+    flip: opt.flip || 1,
+    offset: opt.offset || 0,
+    x: tw.wx,
+    speed: def.speed,
+    maxX: tw.wx + def.range,
+    dmg: opt.dmg != null ? opt.dmg : def.dmg,
+    splash: opt.splash != null ? opt.splash : def.splash,
+    slow: def.slow || 0,
+    behavior: def.behavior,
+    pierceLeft: def.pierce || 1,
+    hitSet: new Set(),      // creeps this bullet already damaged (no double-hit)
+    ttl: 5.0,
+    y: tw.wy,
+    dead: false,
+  });
+}
+
 function fireTower(tw) {
   const def = TOWER_DEF[tw.type];
-  const meta = tw.meta, fn = tw.fn;
-
-  if (tw.type === 'sniper') {
-    // Continuous high-penetration beam: hits EVERY eligible creep on the curve.
-    let hits = 0;
-    for (const c of G.creeps) {
-      const h = curveHit(fn, tw.wx, tw.wy, c.x, c.y, 0.5, 0.03);
-      if (h.dist < def.thr + c.r) {
-        const mult = eligibility(c, meta, h.curveY);
-        if (mult > 0) { damageCreep(c, def.dmg * mult, meta); hits++; }
-      }
-    }
-    G.beams.push({ tw, ttl: 0.12, kind: 'sniper' });
-
-  } else if (tw.type === 'shotgun') {
-    // N parallel pellets: y = f(x) + k*delta (limited x-range to the right).
+  if (tw.type === 'shotgun') {
+    // N parallel pellets at y = f(x) + k*delta, all launched together.
     const N = tw.pellets;
-    for (let k = 0; k < N; k++) {
-      const off = (k - (N - 1) / 2) * def.spread;
-      for (const c of G.creeps) {
-        if (c.x < tw.wx - 0.5 || c.x > tw.wx + def.range) continue; // spread cone in x
-        const h = curveHit((xx) => fn(xx) + off, tw.wx, tw.wy, c.x, c.y, 0.4, 0.03);
-        if (h.dist < def.thr + c.r) {
-          const mult = eligibility(c, meta, h.curveY);
-          if (mult > 0) damageCreep(c, def.dmg * mult, meta);
-        }
-      }
-    }
-    G.beams.push({ tw, ttl: 0.15, kind: 'shotgun', off: def.spread, N });
-
-  } else if (tw.type === 'subwoofer') {
-    // Pulsed field along the curve: slow + small continuous damage.
-    for (const c of G.creeps) {
-      const h = curveHit(fn, tw.wx, tw.wy, c.x, c.y, 0.6, 0.03);
-      if (h.dist < def.thr + c.r) {
-        const mult = eligibility(c, meta, h.curveY);
-        if (mult > 0) { damageCreep(c, def.dmg * mult, meta); c.slowT = 0.25; }
-      }
-    }
-    // subwoofer beam is drawn persistently in render (no transient needed)
-
-  } else if (tw.type === 'bazooka') {
-    // Launch a shell that rides the curve, detonating on contact or at range.
-    G.shells.push({
-      tw, meta, fn,
-      x: tw.wx, // world x of the shell head
-      dir: 1,
-      speed: 6.5,
-      maxX: tw.wx + 12,
-      ttl: 3.0,
-    });
+    for (let k = 0; k < N; k++) spawnBullet(tw, { offset: (k - (N - 1) / 2) * def.spread });
+  } else if (tw.type === 'mirror') {
+    // Twin bullets: y = f(x) and its reflection y = -f(x).
+    spawnBullet(tw, { flip: 1 });
+    spawnBullet(tw, { flip: -1 });
+  } else if (tw.type === 'mortar') {
+    // Lobbed shell whose blast scales with the area under the curve.
+    const area = curveArea(tw.fn, def.range);
+    const mult = Math.max(1, Math.min(4, 1 + area / 8));
+    spawnBullet(tw, { dmg: def.dmg * mult, splash: def.splash * (1 + (mult - 1) * 0.45) });
+  } else {
+    // sniper / bazooka / subwoofer -> a single bullet of their own speed band.
+    spawnBullet(tw, {});
   }
 }
 
@@ -484,6 +492,49 @@ function detonate(sx, sy, meta, def) {
       }
     }
   }
+}
+
+// Advance every bullet along its curve, substepping to avoid tunnelling.
+function updateBullets(dt) {
+  const STEP = 0.15; // max world-units advanced per collision check
+  for (const b of G.bullets) {
+    b.ttl -= dt;
+    if (b.ttl <= 0) { b.dead = true; continue; }
+    let remaining = b.speed * dt;
+    while (remaining > 0 && !b.dead) {
+      const step = Math.min(STEP, remaining);
+      b.x += step; remaining -= step;
+      const y = bulletY(b, b.x);
+      b.y = y;
+      // reached range / off-grid / undefined curve -> stop (explode if a shell)
+      if (!Number.isFinite(y) || b.x >= b.maxX || b.x > XMAX + 0.5) {
+        if (b.behavior === 'explode' && Number.isFinite(y)) {
+          detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg });
+        }
+        b.dead = true; break;
+      }
+      // collision sweep against creeps
+      for (const c of G.creeps) {
+        if (c._dead) continue;
+        if (Math.hypot(c.x - b.x, c.y - y) < c.r + HIT_R) {
+          if (b.behavior === 'explode') {
+            detonate(b.x, y, b.meta, { splash: b.splash, dmg: b.dmg });
+            b.dead = true; break;
+          }
+          if (b.hitSet.has(c)) continue;             // already damaged by this bullet
+          const mult = eligibility(c, b.meta, y);    // y = contact height (Root Bug rule)
+          if (mult > 0) {
+            damageCreep(c, b.dmg * mult, b.meta);
+            if (b.slow > 0) c.slowT = 0.3;
+            b.hitSet.add(c);
+            if (--b.pierceLeft <= 0) { b.dead = true; break; }
+          }
+          // not eligible -> bullet passes through without spending a pierce
+        }
+      }
+    }
+  }
+  G.bullets = G.bullets.filter(b => !b.dead);
 }
 
 /* ---------------------------------------------------------------------------
@@ -534,26 +585,8 @@ function update(dt) {
     }
   }
 
-  // --- shells (bazooka)
-  const bd = TOWER_DEF.bazooka;
-  for (const sh of G.shells) {
-    sh.ttl -= dt;
-    sh.x += sh.speed * dt;
-    const sy = sh.tw.wy + sh.fn(sh.x - sh.tw.wx);
-    let boom = false;
-    if (!Number.isFinite(sy) || sh.x >= sh.maxX || sh.ttl <= 0 || sh.x > XMAX + 0.5) boom = true;
-    let hx = sh.x, hy = sy;
-    if (!boom) {
-      for (const c of G.creeps) {
-        if (Math.hypot(c.x - sh.x, c.y - sy) < c.r + 0.18) { boom = true; hx = sh.x; hy = sy; break; }
-      }
-    }
-    if (boom) {
-      if (Number.isFinite(hy)) detonate(hx, hy, sh.meta, bd);
-      sh._dead = true;
-    } else { sh._y = sy; }
-  }
-  G.shells = G.shells.filter(s => !s._dead);
+  // --- bullets (all archetypes). Substepped sweep so fast rounds can't tunnel.
+  updateBullets(dt);
 
   // --- resolve dead creeps
   for (const c of G.creeps) {
@@ -571,9 +604,7 @@ function update(dt) {
   }
   G.creeps = G.creeps.filter(c => !c._dead);
 
-  // --- beams / fx decay
-  for (const b of G.beams) b.ttl -= dt;
-  G.beams = G.beams.filter(b => b.ttl > 0);
+  // --- fx decay
   for (const f of G.fx) {
     f.ttl -= dt;
     if (f.kind === 'boom') f.r = Math.min(f.max, f.r + dt * f.max * 3);
@@ -632,35 +663,17 @@ function drawCurve(fn, wx0, wy0, color, offset, alpha, xlo, xhi) {
 function render() {
   drawGrid();
 
-  // subwoofer fields (persistent curves)
-  for (const tw of G.towers) {
-    if (tw.type === 'subwoofer') {
-      ctx.lineWidth = 3; drawCurve(tw.fn, tw.wx, tw.wy, TOWER_DEF.subwoofer.color, 0, 0.35); ctx.lineWidth = 1;
-    }
-  }
-  // transient beams
-  for (const b of G.beams) {
-    const def = TOWER_DEF[b.tw.type];
-    const a = Math.max(0.15, b.ttl / 0.15);
-    if (b.kind === 'shotgun') {
-      ctx.lineWidth = 2;
-      for (let k = 0; k < b.N; k++) {
-        const off = (k - (b.N - 1) / 2) * b.off;
-        drawCurve(b.tw.fn, b.tw.wx, b.tw.wy, def.color, off, a, b.tw.wx - 0.5, b.tw.wx + def.range);
-      }
-    } else {
-      ctx.lineWidth = 2; drawCurve(b.tw.fn, b.tw.wx, b.tw.wy, def.color, 0, a);
-    }
+  // bullets: faint curve trace from muzzle to the bullet head, then the head.
+  for (const b of G.bullets) {
+    const traceFn = (t) => b.flip * b.fn(t);
+    ctx.lineWidth = b.behavior === 'field' ? 3 : 1.5;
+    drawCurve(traceFn, b.wx, b.wy, b.def.color, b.offset, b.behavior === 'field' ? 0.30 : 0.22, b.wx, b.x);
     ctx.lineWidth = 1;
-  }
-
-  // shells
-  for (const sh of G.shells) {
-    const y = sh._y != null ? sh._y : sh.tw.wy;
-    // trajectory trace
-    ctx.lineWidth = 1; drawCurve(sh.fn, sh.tw.wx, sh.tw.wy, '#a40', 0, 0.25, sh.tw.wx, sh.x);
-    const p = worldToCanvas(sh.x, y);
-    ctx.fillStyle = '#a40'; ctx.beginPath(); ctx.arc(p.px, p.py, 4, 0, 7); ctx.fill();
+    const p = worldToCanvas(b.x, b.y);
+    ctx.fillStyle = b.def.color;
+    ctx.beginPath();
+    ctx.arc(p.px, p.py, b.behavior === 'explode' ? 4.5 : 3.2, 0, 7);
+    ctx.fill();
   }
 
   // fx
