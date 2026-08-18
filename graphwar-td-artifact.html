@@ -1,0 +1,842 @@
+<title>Graphwar Tower Defense</title>
+<style>
+  /* ---- 10% effort: ultra-flat, unstyled, minimal UI ---- */
+  body { font-family: monospace; margin: 8px; background: #fff; color: #000; }
+  #stats { margin-bottom: 4px; }
+  #stats span { margin-right: 14px; }
+  #controls { margin: 6px 0; }
+  #controls button { font-family: monospace; margin-right: 4px; padding: 3px 6px; }
+  #controls button.sel { outline: 2px solid #000; }
+  #eq { width: 60vw; max-width: 360px; font-family: monospace; padding: 2px; }
+  #pellets { width: 40px; font-family: monospace; }
+  #cost { font-weight: bold; }
+  #meta { color: #444; }
+  #log { white-space: pre-wrap; color: #333; height: 44px; overflow-y: auto; border: 1px solid #ccc; padding: 2px; margin-top: 4px; font-size: 12px; }
+  canvas { border: 1px solid #000; display: block; margin-top: 4px; cursor: crosshair; width: 100%; max-width: 1000px; height: auto; touch-action: manipulation; }
+  .hint { color: #555; font-size: 12px; }
+  code { background: #eee; padding: 0 2px; }
+</style>
+
+<div id="stats">
+  <span>Energy: <b id="s-energy">0</b></span>
+  <span>Base HP: <b id="s-hp">0</b></span>
+  <span>Wave: <b id="s-wave">0</b></span>
+  <span>Creeps: <b id="s-creeps">0</b></span>
+  <span>Live Cost: <b id="cost">--</b></span>
+</div>
+
+<div id="controls">
+  Type:
+  <button id="t-sniper" class="ttype sel" data-t="sniper">Sniper Pro</button>
+  <button id="t-bazooka" class="ttype" data-t="bazooka">Bazooka Dude</button>
+  <button id="t-shotgun" class="ttype" data-t="shotgun">Shotgun Guy</button>
+  <button id="t-subwoofer" class="ttype" data-t="subwoofer">Subwoofer DJ</button>
+  &nbsp;|&nbsp;
+  y = <input id="eq" type="text" value="0*x + 2" spellcheck="false">
+  pellets(N)= <input id="pellets" type="number" value="5" min="1" max="12">
+  <button id="place">Place Turret</button>
+  <button id="wave">Start Wave</button>
+</div>
+
+<div id="meta" class="hint">metadata: --</div>
+<div class="hint">
+  Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Equation is relative to the turret (curve passes through it).
+  Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
+  Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
+</div>
+
+<canvas id="cv" width="1000" height="600"></canvas>
+<div id="log"></div>
+
+<script>
+"use strict";
+/* ============================================================================
+   GRAPHWAR TOWER DEFENSE  (single-file)
+   90% effort -> math evaluation, collision precision, core mechanics.
+   ==========================================================================*/
+
+/* ---------------------------------------------------------------------------
+   1. SAFE MATH EVALUATOR  (recursive-descent parser, NO eval/Function)
+   Grammar:
+     expr   := term (('+'|'-') term)*
+     term   := factor (('*'|'/') factor)*
+     factor := unary ('^' factor)?          (right associative)
+     unary  := ('+'|'-') unary | primary
+     primary:= number | 'x' | const | func '(' expr ')' | '(' expr ')'
+   Produces an AST used for evaluation AND static analysis (degree, funcs).
+--------------------------------------------------------------------------- */
+const FUNCS = {
+  sin: Math.sin, cos: Math.cos, tan: Math.tan,
+  exp: Math.exp, log: Math.log,            // log = natural log (ln)
+  abs: Math.abs, sqrt: Math.sqrt,
+  floor: Math.floor, ceil: Math.ceil
+};
+const CONSTS = { pi: Math.PI, e: Math.E };
+// Which functions count as "advanced" for the pricing formula.
+const ADVANCED_PRICE = new Set(["sin","cos","exp","log","abs","sqrt"]);
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  const s = src;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n') { i++; continue; }
+    if ((c >= '0' && c <= '9') || c === '.') {
+      let j = i;
+      while (j < s.length && ((s[j] >= '0' && s[j] <= '9') || s[j] === '.')) j++;
+      const num = s.slice(i, j);
+      if ((num.match(/\./g) || []).length > 1) throw new Error("bad number '" + num + "'");
+      toks.push({ t: 'num', v: parseFloat(num) });
+      i = j; continue;
+    }
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+      let j = i;
+      while (j < s.length && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= '0' && s[j] <= '9'))) j++;
+      toks.push({ t: 'id', v: s.slice(i, j).toLowerCase() });
+      i = j; continue;
+    }
+    if ("+-*/^()".indexOf(c) !== -1) { toks.push({ t: 'op', v: c }); i++; continue; }
+    throw new Error("unexpected char '" + c + "'");
+  }
+  toks.push({ t: 'end' });
+  return toks;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = () => toks[p];
+  const next = () => toks[p++];
+  function expect(v) {
+    const tk = next();
+    if (!(tk.t === 'op' && tk.v === v)) throw new Error("expected '" + v + "'");
+  }
+  function parseExpr() {
+    let node = parseTerm();
+    while (peek().t === 'op' && (peek().v === '+' || peek().v === '-')) {
+      const op = next().v;
+      const rhs = parseTerm();
+      node = { t: 'op', op, a: node, b: rhs };
+    }
+    return node;
+  }
+  function parseTerm() {
+    let node = parseFactor();
+    while (peek().t === 'op' && (peek().v === '*' || peek().v === '/')) {
+      const op = next().v;
+      const rhs = parseFactor();
+      node = { t: 'op', op, a: node, b: rhs };
+    }
+    return node;
+  }
+  function parseFactor() {
+    const base = parseUnary();
+    if (peek().t === 'op' && peek().v === '^') {
+      next();
+      const exp = parseFactor(); // right associative
+      return { t: 'op', op: '^', a: base, b: exp };
+    }
+    return base;
+  }
+  function parseUnary() {
+    if (peek().t === 'op' && (peek().v === '+' || peek().v === '-')) {
+      const op = next().v;
+      const operand = parseUnary();
+      return op === '-' ? { t: 'neg', a: operand } : operand;
+    }
+    return parsePrimary();
+  }
+  function parsePrimary() {
+    const tk = peek();
+    if (tk.t === 'num') { next(); return { t: 'num', v: tk.v }; }
+    if (tk.t === 'op' && tk.v === '(') {
+      next(); const e = parseExpr(); expect(')'); return e;
+    }
+    if (tk.t === 'id') {
+      next();
+      const name = tk.v;
+      if (name === 'x') return { t: 'x' };
+      if (CONSTS.hasOwnProperty(name)) return { t: 'const', name };
+      if (FUNCS.hasOwnProperty(name)) {
+        expect('(');
+        const arg = parseExpr();
+        expect(')');
+        return { t: 'func', name, arg };
+      }
+      throw new Error("unknown identifier '" + name + "'");
+    }
+    throw new Error("unexpected token");
+  }
+  const ast = parseExpr();
+  if (peek().t !== 'end') throw new Error("trailing input");
+  return ast;
+}
+
+// Evaluate AST at given x. Returns number (may be NaN/Infinity -> caller guards).
+function evalAst(n, x) {
+  switch (n.t) {
+    case 'num': return n.v;
+    case 'x': return x;
+    case 'const': return CONSTS[n.name];
+    case 'neg': return -evalAst(n.a, x);
+    case 'func': return FUNCS[n.name](evalAst(n.arg, x));
+    case 'op': {
+      const a = evalAst(n.a, x);
+      if (n.op === '+') return a + evalAst(n.b, x);
+      if (n.op === '-') return a - evalAst(n.b, x);
+      if (n.op === '*') return a * evalAst(n.b, x);
+      if (n.op === '/') return a / evalAst(n.b, x);
+      if (n.op === '^') return Math.pow(a, evalAst(n.b, x));
+    }
+  }
+  return NaN;
+}
+
+// --- Static analysis of the AST -------------------------------------------
+function astContainsX(n) {
+  switch (n.t) {
+    case 'x': return true;
+    case 'num': case 'const': return false;
+    case 'neg': return astContainsX(n.a);
+    case 'func': return astContainsX(n.arg);
+    case 'op': return astContainsX(n.a) || astContainsX(n.b);
+  }
+  return false;
+}
+// Best-effort polynomial degree in x (for pricing + boss armor).
+function astDegree(n) {
+  switch (n.t) {
+    case 'num': case 'const': return 0;
+    case 'x': return 1;
+    case 'neg': return astDegree(n.a);
+    case 'func': return astDegree(n.arg); // e.g. sin(x^2) -> arg degree 2
+    case 'op': {
+      const da = astDegree(n.a), db = astDegree(n.b);
+      if (n.op === '+' || n.op === '-') return Math.max(da, db);
+      if (n.op === '*') return da + db;
+      if (n.op === '/') return da; // ignore denominator degree
+      if (n.op === '^') {
+        // constant integer exponent -> multiply
+        if (n.b.t === 'num' && Number.isFinite(n.b.v)) return da * n.b.v;
+        return da; // variable exponent -> treat as base degree
+      }
+    }
+  }
+  return 0;
+}
+// Collect function-name usages.
+function astFuncs(n, out) {
+  out = out || {};
+  if (!n) return out;
+  if (n.t === 'func') { out[n.name] = (out[n.name] || 0) + 1; astFuncs(n.arg, out); }
+  else if (n.t === 'neg') astFuncs(n.a, out);
+  else if (n.t === 'op') { astFuncs(n.a, out); astFuncs(n.b, out); }
+  return out;
+}
+
+// Compile a raw string -> { fn, meta } or { error }.
+function compileEquation(raw) {
+  const src = (raw || "").trim();
+  if (src === "") return { error: "empty" };
+  let ast;
+  try { ast = parse(src); }
+  catch (e) { return { error: e.message }; }
+  const funcs = astFuncs(ast);
+  const degree = Math.max(0, Math.round(astDegree(ast)));
+  let advCount = 0;
+  for (const name in funcs) if (ADVANCED_PRICE.has(name)) advCount += funcs[name];
+  const meta = {
+    src,
+    degree,
+    funcs,                                   // map name->count
+    advCount,                                // advanced funcs (pricing)
+    hasTrig: !!(funcs.sin || funcs.cos),     // for phase shield
+    hasExpLogAbs: !!(funcs.exp || funcs.log || funcs.abs), // for boss armor
+    hasX: astContainsX(ast),
+    // linear = degree<=1 AND no functions at all (0*x, m*x+b)
+    isLinear: degree <= 1 && Object.keys(funcs).length === 0,
+  };
+  const fn = (x) => evalAst(ast, x);
+  return { fn, meta };
+}
+
+/* ---------------------------------------------------------------------------
+   2. DYNAMIC PRICING
+   Cost = 50 + strLen*2 + advCount*20 + degree*25 + pelletCount*25
+--------------------------------------------------------------------------- */
+function pelletCountFor(type, pelletsInput) {
+  if (type === 'shotgun') return Math.max(1, Math.min(12, pelletsInput | 0));
+  return 1; // sniper/bazooka/subwoofer fire a single trajectory/field
+}
+function computeCost(raw, type, pelletsInput) {
+  const c = compileEquation(raw);
+  const pc = pelletCountFor(type, pelletsInput);
+  if (c.error) return { cost: null, error: c.error, pellets: pc };
+  const cost = 50
+    + (raw.trim().length * 2)
+    + (c.meta.advCount * 20)
+    + (c.meta.degree * 25)
+    + (pc * 25);
+  return { cost: Math.round(cost), meta: c.meta, pellets: pc };
+}
+
+/* ---------------------------------------------------------------------------
+   3. COORDINATE SYSTEM  (uniform 50 px / world-unit)
+   World: X in [-10,10], Y in [-6,6].  Canvas 1000x600.
+--------------------------------------------------------------------------- */
+const CW = 1000, CH = 600;
+const XMIN = -10, XMAX = 10, YMIN = -6, YMAX = 6;
+const PXU = CW / (XMAX - XMIN); // 50 px per unit (x) ... equals CH/(YMAX-YMIN)=50 (y)
+function worldToCanvas(x, y) {
+  return { px: (x - XMIN) * PXU, py: CH - (y - YMIN) * PXU };
+}
+function canvasToWorld(px, py) {
+  return { x: px / PXU + XMIN, y: (CH - py) / PXU + YMIN };
+}
+
+/* ---------------------------------------------------------------------------
+   4. COLLISION: perpendicular distance from point to y = curve
+   The tower's effective curve is: Y(X) = tower.wy + f(X - tower.wx)
+   We sample a small x-window around the creep and take min point-to-segment
+   distance (world units), plus report the curve's Y at the creep's x
+   (used by Root Bug x-intercept rule).
+--------------------------------------------------------------------------- */
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx, cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
+}
+// Returns {dist, curveY} where curveY is Y of the curve at creep.x (or NaN).
+function curveHit(fn, wx0, wy0, cx, cy, window, step) {
+  window = window || 0.6; step = step || 0.04;
+  let minD = Infinity;
+  let prevX = null, prevY = null;
+  for (let xi = cx - window; xi <= cx + window + 1e-9; xi += step) {
+    const yv = wy0 + fn(xi - wx0);
+    if (Number.isFinite(yv) && Math.abs(yv) < 1e6) {
+      if (prevX !== null) {
+        const d = segDist(cx, cy, prevX, prevY, xi, yv);
+        if (d < minD) minD = d;
+      }
+      prevX = xi; prevY = yv;
+    } else { prevX = null; prevY = null; }
+  }
+  const yAt = wy0 + fn(cx - wx0);
+  return { dist: minD, curveY: Number.isFinite(yAt) ? yAt : NaN };
+}
+
+/* ---------------------------------------------------------------------------
+   5. GAME STATE
+--------------------------------------------------------------------------- */
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+
+const G = {
+  energy: 220,
+  baseHP: 20,
+  wave: 0,
+  towers: [],
+  creeps: [],
+  shells: [],   // bazooka projectiles
+  beams: [],    // transient visual beams
+  fx: [],       // explosions / floating text
+  selType: 'sniper',
+  placing: false,
+  waveActive: false,
+  spawnQueue: [],
+  spawnTimer: 0,
+  over: false,
+};
+
+const TOWER_DEF = {
+  sniper:    { name: 'Sniper Pro',   cd: 0.85, dmg: 6.5, color: '#0a5', thr: 0.22 },
+  bazooka:   { name: 'Bazooka Dude', cd: 2.4,  dmg: 16,  color: '#a40', thr: 0.22, splash: 1.3 },
+  shotgun:   { name: 'Shotgun Guy',  cd: 1.2,  dmg: 3.4, color: '#508', thr: 0.20, spread: 0.35, range: 8 },
+  subwoofer: { name: 'Subwoofer DJ', cd: 0.10, dmg: 0.9, color: '#059', thr: 0.30, slow: 0.5 },
+};
+
+const HIT_THRESHOLD = 0.24; // world units baseline
+
+/* ---------------------------------------------------------------------------
+   6. ENEMIES
+   Each creep flows from right (x=+10) to base at x=-10. When x<=-10 -> base dmg.
+--------------------------------------------------------------------------- */
+function makeCreep(kind, wave) {
+  const y = (Math.random() * 2 - 1) * 5;               // spawn y in [-5,5]
+  const base = { kind, x: XMAX + Math.random() * 1.5, y, baseY: y, t: 0, slowT: 0 };
+  const scale = 1 + wave * 0.06;
+  switch (kind) {
+    case 'basic':   return Object.assign(base, { hp: 12 * scale, max: 12 * scale, speed: 1.1, r: 0.28, reward: 8,  col: '#333' });
+    case 'runner':  return Object.assign(base, { hp: 6 * scale,  max: 6 * scale,  speed: 2.4, r: 0.22, reward: 7,  col: '#c60' });
+    case 'tank':    return Object.assign(base, { hp: 42 * scale, max: 42 * scale, speed: 0.7, r: 0.40, reward: 20, col: '#039' });
+    case 'tangent': return Object.assign(base, { hp: 15 * scale, max: 15 * scale, speed: 1.2, r: 0.28, reward: 14, col: '#093', bob: 1.4 });
+    case 'root':    return Object.assign(base, { hp: 14 * scale, max: 14 * scale, speed: 1.0, r: 0.28, reward: 15, col: '#960', targetY: 0 });
+    case 'phase':   return Object.assign(base, { hp: 18 * scale, max: 18 * scale, speed: 1.0, r: 0.30, reward: 16, col: '#808', phase: Math.round(Math.random()) ? 'sin' : 'cos' });
+    case 'boss':    return Object.assign(base, { hp: 220 * scale, max: 220 * scale, speed: 0.5, r: 0.55, reward: 130, col: '#000', y: 0, baseY: 0 });
+  }
+  return base;
+}
+
+// Damage eligibility: can `meta` (the firing equation) hurt this creep at hitY?
+// Returns a damage multiplier (0 = immune).
+function eligibility(creep, meta, hitY) {
+  switch (creep.kind) {
+    case 'tangent':
+      // needs a non-linear curve (degree>1 OR any function)
+      return meta.isLinear ? 0 : 1;
+    case 'root':
+      // only damaged when the contact point is near the x-axis (y = 0)
+      return (Number.isFinite(hitY) && Math.abs(hitY) < 0.18) ? 1.4 : 0;
+    case 'phase':
+      // needs sin or cos; bonus when the exact phase (sin/cos) matches
+      if (!meta.hasTrig) return 0;
+      return meta.funcs[creep.phase] ? 1.5 : 1;
+    case 'boss':
+      // immune to simple linear; needs degree>2 OR exp/log/abs
+      return (meta.degree > 2 || meta.hasExpLogAbs) ? 1 : 0;
+    default:
+      return 1; // basic / runner / tank
+  }
+}
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent = (msg + "\n" + el.textContent).slice(0, 1200);
+}
+
+/* ---------------------------------------------------------------------------
+   7. FIRING
+--------------------------------------------------------------------------- */
+function damageCreep(creep, dmg, srcMeta) {
+  creep.hp -= dmg;
+  if (creep.hp <= 0) creep._dead = true;
+}
+
+function fireTower(tw) {
+  const def = TOWER_DEF[tw.type];
+  const meta = tw.meta, fn = tw.fn;
+
+  if (tw.type === 'sniper') {
+    // Continuous high-penetration beam: hits EVERY eligible creep on the curve.
+    let hits = 0;
+    for (const c of G.creeps) {
+      const h = curveHit(fn, tw.wx, tw.wy, c.x, c.y, 0.5, 0.03);
+      if (h.dist < def.thr + c.r) {
+        const mult = eligibility(c, meta, h.curveY);
+        if (mult > 0) { damageCreep(c, def.dmg * mult, meta); hits++; }
+      }
+    }
+    G.beams.push({ tw, ttl: 0.12, kind: 'sniper' });
+
+  } else if (tw.type === 'shotgun') {
+    // N parallel pellets: y = f(x) + k*delta (limited x-range to the right).
+    const N = tw.pellets;
+    for (let k = 0; k < N; k++) {
+      const off = (k - (N - 1) / 2) * def.spread;
+      for (const c of G.creeps) {
+        if (c.x < tw.wx - 0.5 || c.x > tw.wx + def.range) continue; // spread cone in x
+        const h = curveHit((xx) => fn(xx) + off, tw.wx, tw.wy, c.x, c.y, 0.4, 0.03);
+        if (h.dist < def.thr + c.r) {
+          const mult = eligibility(c, meta, h.curveY);
+          if (mult > 0) damageCreep(c, def.dmg * mult, meta);
+        }
+      }
+    }
+    G.beams.push({ tw, ttl: 0.15, kind: 'shotgun', off: def.spread, N });
+
+  } else if (tw.type === 'subwoofer') {
+    // Pulsed field along the curve: slow + small continuous damage.
+    for (const c of G.creeps) {
+      const h = curveHit(fn, tw.wx, tw.wy, c.x, c.y, 0.6, 0.03);
+      if (h.dist < def.thr + c.r) {
+        const mult = eligibility(c, meta, h.curveY);
+        if (mult > 0) { damageCreep(c, def.dmg * mult, meta); c.slowT = 0.25; }
+      }
+    }
+    // subwoofer beam is drawn persistently in render (no transient needed)
+
+  } else if (tw.type === 'bazooka') {
+    // Launch a shell that rides the curve, detonating on contact or at range.
+    G.shells.push({
+      tw, meta, fn,
+      x: tw.wx, // world x of the shell head
+      dir: 1,
+      speed: 6.5,
+      maxX: tw.wx + 12,
+      ttl: 3.0,
+    });
+  }
+}
+
+function detonate(sx, sy, meta, def) {
+  G.fx.push({ x: sx, y: sy, r: 0.1, max: def.splash, ttl: 0.35, kind: 'boom' });
+  for (const c of G.creeps) {
+    const d = Math.hypot(c.x - sx, c.y - sy);
+    if (d < def.splash + c.r) {
+      const mult = eligibility(c, meta, sy); // contact y = detonation y
+      if (mult > 0) {
+        const falloff = 1 - d / (def.splash + c.r);
+        damageCreep(c, def.dmg * Math.max(0.35, falloff) * mult, meta);
+      }
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   8. UPDATE LOOP
+--------------------------------------------------------------------------- */
+function update(dt) {
+  if (G.over) return;
+
+  // --- spawn queued creeps for active wave
+  if (G.waveActive) {
+    G.spawnTimer -= dt;
+    if (G.spawnTimer <= 0 && G.spawnQueue.length) {
+      G.creeps.push(makeCreep(G.spawnQueue.shift(), G.wave));
+      G.spawnTimer = 0.65;
+    }
+    if (G.spawnQueue.length === 0 && G.creeps.length === 0) {
+      G.waveActive = false;
+      G.energy += 40 + G.wave * 5;
+      log("Wave " + G.wave + " cleared! +" + (40 + G.wave * 5) + " energy.");
+    }
+  }
+
+  // --- creeps
+  for (const c of G.creeps) {
+    c.t += dt;
+    const slowMul = c.slowT > 0 ? 0.45 : 1;
+    if (c.slowT > 0) c.slowT -= dt;
+    c.x -= c.speed * slowMul * dt;
+    // per-kind vertical behavior
+    if (c.kind === 'tangent') {
+      // weaves vertically (perpendicular to flat lines) so linear shots miss
+      c.y = c.baseY + Math.sin(c.t * 3.0) * c.bob;
+    } else if (c.kind === 'root') {
+      // drifts toward the x-axis (y=0), where it is vulnerable
+      c.y += (0 - c.y) * Math.min(1, dt * 0.8);
+    }
+    if (c.x <= XMIN) {
+      c._dead = true; c._leaked = true;
+    }
+  }
+
+  // --- towers fire
+  for (const tw of G.towers) {
+    tw.cd -= dt;
+    if (tw.cd <= 0 && G.creeps.length > 0) {
+      tw.cd = TOWER_DEF[tw.type].cd;
+      fireTower(tw);
+    }
+  }
+
+  // --- shells (bazooka)
+  const bd = TOWER_DEF.bazooka;
+  for (const sh of G.shells) {
+    sh.ttl -= dt;
+    sh.x += sh.speed * dt;
+    const sy = sh.tw.wy + sh.fn(sh.x - sh.tw.wx);
+    let boom = false;
+    if (!Number.isFinite(sy) || sh.x >= sh.maxX || sh.ttl <= 0 || sh.x > XMAX + 0.5) boom = true;
+    let hx = sh.x, hy = sy;
+    if (!boom) {
+      for (const c of G.creeps) {
+        if (Math.hypot(c.x - sh.x, c.y - sy) < c.r + 0.18) { boom = true; hx = sh.x; hy = sy; break; }
+      }
+    }
+    if (boom) {
+      if (Number.isFinite(hy)) detonate(hx, hy, sh.meta, bd);
+      sh._dead = true;
+    } else { sh._y = sy; }
+  }
+  G.shells = G.shells.filter(s => !s._dead);
+
+  // --- resolve dead creeps
+  for (const c of G.creeps) {
+    if (c._dead) {
+      if (c._leaked) {
+        const dmg = c.kind === 'boss' ? 8 : (c.kind === 'tank' ? 3 : 1);
+        G.baseHP -= dmg;
+        log((c.kind) + " reached the base! -" + dmg + " HP");
+        if (G.baseHP <= 0) { G.baseHP = 0; G.over = true; log("=== GAME OVER ==="); }
+      } else {
+        G.energy += c.reward;
+        G.fx.push({ x: c.x, y: c.y, ttl: 0.6, kind: 'text', text: '+' + c.reward });
+      }
+    }
+  }
+  G.creeps = G.creeps.filter(c => !c._dead);
+
+  // --- beams / fx decay
+  for (const b of G.beams) b.ttl -= dt;
+  G.beams = G.beams.filter(b => b.ttl > 0);
+  for (const f of G.fx) {
+    f.ttl -= dt;
+    if (f.kind === 'boom') f.r = Math.min(f.max, f.r + dt * f.max * 3);
+    if (f.kind === 'text') f.y += dt * 1.2;
+  }
+  G.fx = G.fx.filter(f => f.ttl > 0);
+}
+
+/* ---------------------------------------------------------------------------
+   9. RENDER
+--------------------------------------------------------------------------- */
+function drawGrid() {
+  ctx.clearRect(0, 0, CW, CH);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, CW, CH);
+  ctx.lineWidth = 1;
+  // minor grid
+  ctx.strokeStyle = '#eee';
+  ctx.beginPath();
+  for (let x = XMIN; x <= XMAX; x++) { const p = worldToCanvas(x, 0).px; ctx.moveTo(p, 0); ctx.lineTo(p, CH); }
+  for (let y = YMIN; y <= YMAX; y++) { const p = worldToCanvas(0, y).py; ctx.moveTo(0, p); ctx.lineTo(CW, p); }
+  ctx.stroke();
+  // axes
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 1.5;
+  const o = worldToCanvas(0, 0);
+  ctx.beginPath();
+  ctx.moveTo(0, o.py); ctx.lineTo(CW, o.py);
+  ctx.moveTo(o.px, 0); ctx.lineTo(o.px, CH);
+  ctx.stroke();
+  // ticks
+  ctx.fillStyle = '#777'; ctx.font = '10px monospace';
+  for (let x = XMIN; x <= XMAX; x += 2) { const p = worldToCanvas(x, 0); ctx.fillText(String(x), p.px + 1, o.py + 11); }
+  for (let y = YMIN; y <= YMAX; y += 2) { if (y === 0) continue; const p = worldToCanvas(0, y); ctx.fillText(String(y), o.px + 3, p.py - 1); }
+  // base wall on the left
+  ctx.strokeStyle = '#c00'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(2, 0); ctx.lineTo(2, CH); ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+function drawCurve(fn, wx0, wy0, color, offset, alpha, xlo, xhi) {
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.beginPath();
+  let pen = false;
+  const lo = xlo == null ? XMIN : xlo, hi = xhi == null ? XMAX : xhi;
+  for (let x = lo; x <= hi; x += 0.05) {
+    const y = wy0 + fn(x - wx0) + (offset || 0);
+    if (Number.isFinite(y) && Math.abs(y) < 50) {
+      const p = worldToCanvas(x, y);
+      if (!pen) { ctx.moveTo(p.px, p.py); pen = true; } else ctx.lineTo(p.px, p.py);
+    } else pen = false;
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function render() {
+  drawGrid();
+
+  // subwoofer fields (persistent curves)
+  for (const tw of G.towers) {
+    if (tw.type === 'subwoofer') {
+      ctx.lineWidth = 3; drawCurve(tw.fn, tw.wx, tw.wy, TOWER_DEF.subwoofer.color, 0, 0.35); ctx.lineWidth = 1;
+    }
+  }
+  // transient beams
+  for (const b of G.beams) {
+    const def = TOWER_DEF[b.tw.type];
+    const a = Math.max(0.15, b.ttl / 0.15);
+    if (b.kind === 'shotgun') {
+      ctx.lineWidth = 2;
+      for (let k = 0; k < b.N; k++) {
+        const off = (k - (b.N - 1) / 2) * b.off;
+        drawCurve(b.tw.fn, b.tw.wx, b.tw.wy, def.color, off, a, b.tw.wx - 0.5, b.tw.wx + def.range);
+      }
+    } else {
+      ctx.lineWidth = 2; drawCurve(b.tw.fn, b.tw.wx, b.tw.wy, def.color, 0, a);
+    }
+    ctx.lineWidth = 1;
+  }
+
+  // shells
+  for (const sh of G.shells) {
+    const y = sh._y != null ? sh._y : sh.tw.wy;
+    // trajectory trace
+    ctx.lineWidth = 1; drawCurve(sh.fn, sh.tw.wx, sh.tw.wy, '#a40', 0, 0.25, sh.tw.wx, sh.x);
+    const p = worldToCanvas(sh.x, y);
+    ctx.fillStyle = '#a40'; ctx.beginPath(); ctx.arc(p.px, p.py, 4, 0, 7); ctx.fill();
+  }
+
+  // fx
+  for (const f of G.fx) {
+    if (f.kind === 'boom') {
+      const p = worldToCanvas(f.x, f.y);
+      ctx.strokeStyle = 'rgba(200,60,0,' + (f.ttl / 0.35) + ')';
+      ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.px, p.py, f.r * PXU, 0, 7); ctx.stroke(); ctx.lineWidth = 1;
+    } else if (f.kind === 'text') {
+      const p = worldToCanvas(f.x, f.y);
+      ctx.fillStyle = 'rgba(0,120,0,' + Math.min(1, f.ttl * 2) + ')';
+      ctx.font = '11px monospace'; ctx.fillText(f.text, p.px, p.py);
+    }
+  }
+
+  // towers
+  for (const tw of G.towers) {
+    const p = worldToCanvas(tw.wx, tw.wy);
+    const def = TOWER_DEF[tw.type];
+    ctx.fillStyle = def.color;
+    ctx.fillRect(p.px - 6, p.py - 6, 12, 12);
+    ctx.fillStyle = '#000'; ctx.font = '9px monospace';
+    ctx.fillText(def.name.split(' ')[0], p.px - 6, p.py - 8);
+  }
+
+  // creeps
+  for (const c of G.creeps) {
+    const p = worldToCanvas(c.x, c.y);
+    ctx.fillStyle = c.col;
+    ctx.beginPath(); ctx.arc(p.px, p.py, c.r * PXU, 0, 7); ctx.fill();
+    if (c.slowT > 0) { ctx.strokeStyle = '#0af'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.px, p.py, c.r * PXU + 2, 0, 7); ctx.stroke(); ctx.lineWidth = 1; }
+    // hp bar
+    const w = 24, hpw = w * Math.max(0, c.hp / c.max);
+    ctx.fillStyle = '#c00'; ctx.fillRect(p.px - w / 2, p.py - c.r * PXU - 8, w, 3);
+    ctx.fillStyle = '#0a0'; ctx.fillRect(p.px - w / 2, p.py - c.r * PXU - 8, hpw, 3);
+    // kind tag
+    ctx.fillStyle = '#000'; ctx.font = '8px monospace';
+    const tag = { basic:'B', runner:'R', tank:'T', tangent:'~', root:'0', phase:'φ', boss:'BOSS' }[c.kind];
+    ctx.fillText(tag, p.px - (c.kind==='boss'?11:2), p.py + 3);
+  }
+
+  // placement ghost
+  if (G.placing && G.mouse) {
+    const wc = canvasToWorld(G.mouse.px, G.mouse.py);
+    const c = compileEquation(document.getElementById('eq').value);
+    if (!c.error) { ctx.lineWidth = 1; drawCurve(c.fn, wc.x, wc.y, '#000', 0, 0.4); ctx.lineWidth = 1; }
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(G.mouse.px - 6, G.mouse.py - 6, 12, 12);
+  }
+
+  if (G.over) {
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fillRect(0, 0, CW, CH);
+    ctx.fillStyle = '#000'; ctx.font = '40px monospace';
+    ctx.fillText('GAME OVER — Wave ' + G.wave, 280, 300);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   10. WAVES
+--------------------------------------------------------------------------- */
+function buildWave(n) {
+  const q = [];
+  const count = 5 + n * 2;
+  for (let i = 0; i < count; i++) {
+    const r = Math.random();
+    if (n >= 3 && r < 0.15) q.push('tank');
+    else if (n >= 2 && r < 0.32) q.push('runner');
+    else if (n >= 4 && r < 0.47) q.push('tangent');
+    else if (n >= 4 && r < 0.60) q.push('root');
+    else if (n >= 5 && r < 0.72) q.push('phase');
+    else q.push('basic');
+  }
+  if (n % 5 === 0) q.push('boss'); // Exponential Boss every 5 waves
+  return q;
+}
+
+/* ---------------------------------------------------------------------------
+   11. UI WIRING (minimal)
+--------------------------------------------------------------------------- */
+function refreshStats() {
+  document.getElementById('s-energy').textContent = Math.floor(G.energy);
+  document.getElementById('s-hp').textContent = G.baseHP;
+  document.getElementById('s-wave').textContent = G.wave;
+  document.getElementById('s-creeps').textContent = G.creeps.length;
+}
+function refreshCostPreview() {
+  const raw = document.getElementById('eq').value;
+  const pel = parseInt(document.getElementById('pellets').value, 10) || 1;
+  const r = computeCost(raw, G.selType, pel);
+  const costEl = document.getElementById('cost');
+  const metaEl = document.getElementById('meta');
+  if (r.error) {
+    costEl.textContent = 'ERR (' + r.error + ')';
+    metaEl.textContent = 'metadata: invalid equation';
+  } else {
+    costEl.textContent = r.cost + ' energy';
+    const m = r.meta;
+    metaEl.textContent = 'metadata: degree=' + m.degree +
+      ' | advFuncs=' + m.advCount +
+      ' | pellets=' + r.pellets +
+      ' | trig=' + (m.hasTrig ? 'yes' : 'no') +
+      ' | exp/log/abs=' + (m.hasExpLogAbs ? 'yes' : 'no') +
+      ' | linear=' + (m.isLinear ? 'yes' : 'no');
+  }
+}
+
+document.querySelectorAll('.ttype').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.ttype').forEach(b => b.classList.remove('sel'));
+    btn.classList.add('sel');
+    G.selType = btn.getAttribute('data-t');
+    refreshCostPreview();
+  });
+});
+document.getElementById('eq').addEventListener('input', refreshCostPreview);
+document.getElementById('pellets').addEventListener('input', refreshCostPreview);
+
+document.getElementById('place').addEventListener('click', () => {
+  const raw = document.getElementById('eq').value;
+  const c = compileEquation(raw);
+  if (c.error) { log("Cannot place: bad equation (" + c.error + ")"); return; }
+  G.placing = true;
+  log("Placement armed: click the grid to drop a " + TOWER_DEF[G.selType].name + ".");
+});
+
+document.getElementById('wave').addEventListener('click', () => {
+  if (G.over) return;
+  if (G.waveActive) { log("Wave already in progress."); return; }
+  G.wave++;
+  G.spawnQueue = buildWave(G.wave);
+  G.waveActive = true;
+  G.spawnTimer = 0;
+  log("Wave " + G.wave + " started (" + G.spawnQueue.length + " creeps)" + (G.wave % 5 === 0 ? " — EXPONENTIAL BOSS incoming!" : "") + ".");
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  G.mouse = { px: (e.clientX - rect.left) * (CW / rect.width), py: (e.clientY - rect.top) * (CH / rect.height) };
+});
+canvas.addEventListener('click', (e) => {
+  if (!G.placing) return;
+  const rect = canvas.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (CW / rect.width);
+  const py = (e.clientY - rect.top) * (CH / rect.height);
+  const w = canvasToWorld(px, py);
+  const raw = document.getElementById('eq').value;
+  const pel = parseInt(document.getElementById('pellets').value, 10) || 1;
+  const r = computeCost(raw, G.selType, pel);
+  if (r.error) { log("Bad equation."); return; }
+  if (r.cost > G.energy) { log("Not enough energy (" + r.cost + " needed, have " + Math.floor(G.energy) + ")."); return; }
+  const c = compileEquation(raw);
+  G.energy -= r.cost;
+  G.towers.push({
+    type: G.selType, wx: w.x, wy: w.y,
+    fn: c.fn, meta: c.meta, cd: 0,
+    pellets: pelletCountFor(G.selType, pel),
+    eq: raw.trim(),
+  });
+  G.placing = false;
+  log("Placed " + TOWER_DEF[G.selType].name + " @ (" + w.x.toFixed(1) + "," + w.y.toFixed(1) + ") eq: y=" + raw.trim() + " cost " + r.cost + ".");
+});
+
+/* ---------------------------------------------------------------------------
+   12. MAIN LOOP
+--------------------------------------------------------------------------- */
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05; // clamp
+  update(dt);
+  render();
+  refreshStats();
+  requestAnimationFrame(frame);
+}
+refreshCostPreview();
+log("Welcome to Graphwar Tower Defense. Place turrets by typing y=f(x), then Start Wave.");
+requestAnimationFrame(frame);
+</script>
