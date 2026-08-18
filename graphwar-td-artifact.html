@@ -33,6 +33,7 @@
   <button id="t-subwoofer" class="ttype" data-t="subwoofer">Subwoofer DJ</button>
   <button id="t-mirror" class="ttype" data-t="mirror">Mirror Mage</button>
   <button id="t-mortar" class="ttype" data-t="mortar">Integral Mortar</button>
+  <button id="t-railgun" class="ttype" data-t="railgun">Derivative Railgun</button>
   &nbsp;|&nbsp;
   y = <input id="eq" type="text" value="0*x + 2" spellcheck="false">
   pellets(N)= <input id="pellets" type="number" value="5" min="1" max="12">
@@ -44,7 +45,8 @@
 <div class="hint">
   Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Bullets ride the curve <b>rightward</b> from the turret, so place turrets to the LEFT of the incoming lane.
   Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
-  Speed bands: Sniper 16 (pierces all) · Mirror 11 (twin ±f, pierce 2) · Shotgun 9 (short) · Bazooka 6.5 (splash) · Mortar 5 (area-scaled blast) · Subwoofer 3.5 (slow wave, pierces all).
+  Path speed (arc-length/sec): Railgun 20 (rides f'(x), pierce 3) · Sniper 16 (pierces all) · Mirror 11 (twin ±f) · Shotgun 9 (short) · Bazooka 6.5 (splash) · Mortar 5 (area blast) · Subwoofer 3.5 (slow wave).
+  <b>Curviness tax:</b> bullets ride the curve at path speed, so wavy shots travel longer AND lose damage with excess arc length — a straight shot keeps full punch; spamming <code>sin</code> hits softer. (Splash towers are exempt.)
   Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
 </div>
 
@@ -363,9 +365,24 @@ const TOWER_DEF = {
   subwoofer: { name: 'Subwoofer DJ',   cd: 0.55, dmg: 1.7, color: '#059', speed: 3.5, range: 20, behavior: 'field',   pierce: 1e9, slow: 0.5 },
   mirror:    { name: 'Mirror Mage',    cd: 1.0,  dmg: 5.0, color: '#c09', speed: 11,  range: 20, behavior: 'pierce',  pierce: 2 },
   mortar:    { name: 'Integral Mortar',cd: 2.8,  dmg: 11,  color: '#680', speed: 5,   range: 12, behavior: 'explode', splash: 1.0 },
+  railgun:   { name: 'Derivative Railgun', cd: 1.1, dmg: 9, color: '#0aa', speed: 20, range: 20, behavior: 'pierce', pierce: 3, deriv: true },
 };
 
-const HIT_R = 0.16; // extra bullet contact radius (world units)
+const HIT_R = 0.16;    // extra bullet contact radius (world units)
+const ARC_TAX = 0.15;  // damage lost per world-unit of EXCESS arc length
+const ARC_FLOOR = 0.35;// minimum damage fraction after the curviness tax
+
+// Numeric derivative of a compiled equation (for the Derivative Railgun).
+function derivOf(fn) {
+  const h = 0.008;
+  return (t) => (fn(t + h) - fn(t - h)) / (2 * h);
+}
+// Curviness damage tax: straight shots keep full damage at any range;
+// only the arc length spent bending (excess over horizontal distance) is taxed.
+function arcTax(b) {
+  const excess = Math.max(0, b.arc - (b.x - b.startX));
+  return Math.max(ARC_FLOOR, 1 - excess * ARC_TAX);
+}
 
 /* ---------------------------------------------------------------------------
    6. ENEMIES
@@ -441,16 +458,22 @@ function spawnBullet(tw, opt) {
   opt = opt || {};
   const def = TOWER_DEF[tw.type];
   G.bullets.push({
-    tw, def, meta: tw.meta, fn: tw.fn, wx: tw.wx, wy: tw.wy,
+    tw, def, meta: tw.meta,
+    fn: def.deriv ? derivOf(tw.fn) : tw.fn, // Railgun rides f'(x)
+    wx: tw.wx, wy: tw.wy,
     flip: opt.flip || 1,
     offset: opt.offset || 0,
     x: tw.wx,
-    speed: def.speed,
+    startX: tw.wx,          // for the arc-length (curviness) tax
+    arc: 0,                 // path length travelled so far
+    age: 0,                 // seconds in flight
+    speed: def.speed,       // now interpreted as PATH speed (arc-units / sec)
     maxX: tw.wx + def.range,
     dmg: opt.dmg != null ? opt.dmg : def.dmg,
     splash: opt.splash != null ? opt.splash : def.splash,
     slow: def.slow || 0,
     behavior: def.behavior,
+    taxed: def.behavior !== 'explode', // explosives keep full damage (mortar area)
     pierceLeft: def.pierce || 1,
     hitSet: new Set(),      // creeps this bullet already damaged (no double-hit)
     ttl: 5.0,
@@ -475,7 +498,7 @@ function fireTower(tw) {
     const mult = Math.max(1, Math.min(4, 1 + area / 8));
     spawnBullet(tw, { dmg: def.dmg * mult, splash: def.splash * (1 + (mult - 1) * 0.45) });
   } else {
-    // sniper / bazooka / subwoofer -> a single bullet of their own speed band.
+    // sniper / bazooka / subwoofer / railgun -> single bullet, own speed band.
     spawnBullet(tw, {});
   }
 }
@@ -494,16 +517,25 @@ function detonate(sx, sy, meta, def) {
   }
 }
 
-// Advance every bullet along its curve, substepping to avoid tunnelling.
+// Advance every bullet ALONG its curve at path speed, substepping to avoid
+// tunnelling. Because speed is arc-length/sec, a wavy curve covers less x per
+// second -> literally longer travel time, and its excess arc is damage-taxed.
 function updateBullets(dt) {
-  const STEP = 0.15; // max world-units advanced per collision check
+  const STEP_DS = 0.12; // max arc-length advanced per collision check
   for (const b of G.bullets) {
-    b.ttl -= dt;
+    b.ttl -= dt; b.age += dt;
     if (b.ttl <= 0) { b.dead = true; continue; }
-    let remaining = b.speed * dt;
+    let remaining = b.speed * dt; // path length to travel this frame
     while (remaining > 0 && !b.dead) {
-      const step = Math.min(STEP, remaining);
-      b.x += step; remaining -= step;
+      const ds = Math.min(STEP_DS, remaining);
+      // horizontal step from arc step: dx = ds / sqrt(1 + slope^2)
+      const hh = 0.01;
+      let slope = (bulletY(b, b.x + hh) - bulletY(b, b.x - hh)) / (2 * hh);
+      if (!Number.isFinite(slope)) slope = 0;
+      const s2 = Math.min(slope * slope, 25); // cap so steep curves crawl, not stall
+      b.x += ds / Math.sqrt(1 + s2);
+      b.arc += ds;
+      remaining -= ds;
       const y = bulletY(b, b.x);
       b.y = y;
       // reached range / off-grid / undefined curve -> stop (explode if a shell)
@@ -524,7 +556,8 @@ function updateBullets(dt) {
           if (b.hitSet.has(c)) continue;             // already damaged by this bullet
           const mult = eligibility(c, b.meta, y);    // y = contact height (Root Bug rule)
           if (mult > 0) {
-            damageCreep(c, b.dmg * mult, b.meta);
+            const tax = b.taxed ? arcTax(b) : 1;     // curvy paths hit softer
+            damageCreep(c, b.dmg * mult * tax, b.meta);
             if (b.slow > 0) c.slowT = 0.3;
             b.hitSet.add(c);
             if (--b.pierceLeft <= 0) { b.dead = true; break; }
