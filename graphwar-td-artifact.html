@@ -1,59 +1,65 @@
 <title>Graphwar Tower Defense</title>
 <style>
-  /* Flat "app-window" UI. Single committed light theme, all colors explicit. */
+  /* Windows 95/98 era UI. Silver 3D bevels, group boxes, navy title bar. */
   :root {
-    --bg:#e9ebee; --win:#f7f8fa; --chrome:#33414d; --chrome-fg:#ffffff;
-    --ink:#1d2733; --muted:#7a8591; --line:#d3d8dd;
-    --accent:#2d7dd2; --accent-bg:#e5f0fb;
-    --btn:#eef1f4; --btn-hover:#e2e7ec; --panel:#eef1f4; --field:#ffffff;
+    --silver:#c0c0c0; --gray:#808080; --dark:#0a0a0a; --lite:#dfdfdf; --white:#ffffff;
+    --navy:#000080; --navy2:#1084d0; --desktop:#008080; --field:#ffffff; --ink:#000000;
+    /* classic 4-tone bevels */
+    --raise: inset -1px -1px var(--dark), inset 1px 1px var(--white), inset -2px -2px var(--gray), inset 2px 2px var(--lite);
+    --sink:  inset -1px -1px var(--white), inset 1px 1px var(--gray), inset -2px -2px var(--lite), inset 2px 2px var(--dark);
   }
   * { box-sizing: border-box; }
-  body { margin:0; padding:16px; background:var(--bg); color:var(--ink);
-    font-family:"Segoe UI", system-ui, -apple-system, sans-serif; font-size:13px; }
-  .window { max-width:1032px; margin:0 auto; background:var(--win); border:1px solid var(--line); }
+  body { margin:0; padding:24px; background:var(--desktop); color:var(--ink);
+    font-family:Tahoma, Geneva, "MS Sans Serif", sans-serif; font-size:12px; }
+  .window { max-width:1044px; margin:0 auto; background:var(--silver); box-shadow:var(--raise); padding:3px; }
   .titlebar { display:flex; align-items:center; justify-content:space-between;
-    background:var(--chrome); color:var(--chrome-fg); padding:7px 10px; }
-  .titlebar .title { font-weight:600; letter-spacing:.3px; }
-  .winbtns { display:flex; gap:6px; }
-  .winbtns i { width:12px; height:12px; display:block; }
-  .winbtns .n { background:#4bb36a; } .winbtns .m { background:#e0a94b; } .winbtns .c { background:#e05b4b; }
-  .body { padding:12px 14px 16px; }
-  .statusbar { display:flex; flex-wrap:wrap; gap:6px 18px; padding:8px 12px;
-    background:var(--panel); border:1px solid var(--line); margin-bottom:12px; }
-  .section { margin-bottom:12px; }
-  .label { text-transform:uppercase; letter-spacing:1.2px; font-size:11px; color:var(--muted); margin-bottom:6px; }
-  .tiles { display:flex; flex-wrap:wrap; gap:8px; }
+    background:linear-gradient(90deg, var(--navy), var(--navy2)); color:#fff; padding:3px 3px 3px 6px; }
+  .titlebar .title { font-weight:bold; }
+  .winbtns { display:flex; gap:2px; }
+  .winbtns button { width:18px; height:16px; background:var(--silver); box-shadow:var(--raise);
+    border:none; font:inherit; font-size:10px; line-height:1; display:flex; align-items:center;
+    justify-content:center; padding:0; cursor:default; }
+  .winbtns button:active { box-shadow:var(--sink); }
+  .body { padding:10px; }
+  .statusbar { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:10px; }
+  .statusbar span { background:var(--silver); box-shadow:var(--sink); padding:3px 8px; }
+  .section { position:relative; margin:16px 0 10px; padding:14px 10px 10px; border:2px groove var(--white); }
+  .label { position:absolute; top:-9px; left:8px; background:var(--silver); padding:0 4px; }
+  .tiles { display:flex; flex-wrap:wrap; gap:6px; }
   .tile { display:flex; flex-direction:column; align-items:center; justify-content:center;
-    width:100px; padding:9px 4px; background:var(--field); border:1px solid var(--line);
-    color:var(--ink); font:inherit; cursor:pointer; text-align:center; }
-  .tile:hover { background:var(--btn-hover); }
-  .tile.sel { border-color:var(--accent); background:var(--accent-bg); box-shadow:inset 0 0 0 1px var(--accent); }
-  .tile .ico { width:26px; height:26px; display:block; margin-bottom:6px; }
-  .row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
-  .btn { font:inherit; padding:6px 12px; background:var(--btn); border:1px solid var(--line); color:var(--ink); cursor:pointer; }
-  .btn:hover { background:var(--btn-hover); }
-  .btn:disabled { color:#aab2ba; background:#f2f4f6; cursor:default; }
-  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .btn.primary:hover { background:#2568b0; }
-  input[type=text], input[type=number] { font:inherit; padding:5px 7px; border:1px solid var(--line); background:var(--field); color:var(--ink); }
-  #eq { width:min(360px, 60vw); }
-  #pellets { width:54px; }
-  #cost { font-weight:700; color:var(--accent); }
-  #meta { color:var(--muted); font-size:12px; margin-top:6px; }
-  #selpanel { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border:1px solid var(--line); }
-  #selinfo { flex:1 1 320px; }
-  .hint { color:var(--muted); font-size:12px; line-height:1.55; margin:10px 0; }
-  canvas { display:block; width:100%; max-width:1000px; height:auto; border:1px solid var(--line);
-    background:#fff; margin-top:6px; cursor:crosshair; touch-action:manipulation; }
-  #log { white-space:pre-wrap; color:#55606b; height:64px; overflow-y:auto; border:1px solid var(--line);
-    background:#fbfcfd; padding:6px 8px; margin-top:8px; font-size:12px; font-family:"Consolas", ui-monospace, monospace; }
-  code { background:#e7ebef; padding:1px 4px; font-family:"Consolas", ui-monospace, monospace; }
+    width:106px; padding:8px 4px; background:var(--silver); box-shadow:var(--raise);
+    border:none; color:var(--ink); font:inherit; cursor:pointer; text-align:center; }
+  .tile:active { box-shadow:var(--sink); }
+  .tile.sel { box-shadow:var(--sink); background:#b6b6b6; }
+  .tile .ico { width:28px; height:28px; display:block; margin-bottom:6px; box-shadow: inset -1px -1px rgba(0,0,0,.5), inset 1px 1px rgba(255,255,255,.5); }
+  .row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+  .btn { background:var(--silver); box-shadow:var(--raise); border:none; padding:4px 12px; font:inherit; cursor:pointer; min-width:78px; }
+  .btn:active { box-shadow:var(--sink); }
+  .btn:disabled { color:var(--gray); text-shadow:1px 1px var(--white); }
+  .btn.primary { font-weight:bold; }
+  input[type=text], input[type=number] { background:var(--field); box-shadow:var(--sink); border:none; padding:3px 5px; font:inherit; color:var(--ink); }
+  #eq { width:min(340px, 58vw); }
+  #pellets { width:52px; }
+  #cost { font-weight:bold; }
+  #meta { margin-top:6px; color:#222; }
+  #selpanel { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+  #selinfo { flex:1 1 320px; background:var(--field); box-shadow:var(--sink); padding:4px 6px; }
+  .hint { margin:8px 0; line-height:1.5; color:#111; }
+  canvas { display:block; width:100%; max-width:1000px; height:auto; background:#fff;
+    box-shadow:var(--sink); margin-top:6px; padding:2px; cursor:crosshair; touch-action:manipulation; }
+  #log { white-space:pre-wrap; height:64px; overflow-y:auto; background:var(--field); box-shadow:var(--sink);
+    padding:4px 6px; margin-top:8px; font-size:11px; font-family:"Courier New", monospace; }
+  code { background:var(--field); box-shadow:var(--sink); padding:0 3px; font-family:"Courier New", monospace; }
 </style>
 
 <div class="window">
   <div class="titlebar">
     <span class="title">Graphwar Tower Defense</span>
-    <span class="winbtns"><i class="n"></i><i class="m"></i><i class="c"></i></span>
+    <span class="winbtns">
+      <button type="button" tabindex="-1" aria-hidden="true">_</button>
+      <button type="button" tabindex="-1" aria-hidden="true">&#9633;</button>
+      <button type="button" tabindex="-1" aria-hidden="true">&#10005;</button>
+    </span>
   </div>
   <div class="body">
 
