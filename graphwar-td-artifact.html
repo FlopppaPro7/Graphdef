@@ -1,66 +1,121 @@
 <title>Graphwar Tower Defense</title>
 <style>
-  /* Deliberately bland, raw, functional. All budget goes to the engine. */
-  body { font-family: monospace; margin: 8px; background: #fff; color: #000; }
-  #stats span { margin-right: 14px; }
-  #controls { margin: 6px 0; }
-  #controls button, #selpanel button { font-family: monospace; margin-right: 4px; padding: 3px 6px; }
-  #controls button.sel { outline: 2px solid #000; }
-  #eq { width: 60vw; max-width: 340px; font-family: monospace; padding: 2px; }
-  #pellets { width: 44px; font-family: monospace; }
-  #cost { font-weight: bold; }
-  #meta { color: #444; }
-  #selpanel { margin: 4px 0; }
-  #log { white-space: pre-wrap; color: #333; height: 46px; overflow-y: auto; border: 1px solid #ccc; padding: 2px; margin-top: 4px; font-size: 12px; }
-  canvas { border: 1px solid #000; display: block; margin-top: 4px; cursor: crosshair; width: 100%; max-width: 1000px; height: auto; touch-action: manipulation; }
-  .hint { color: #555; font-size: 12px; }
-  code { background: #eee; padding: 0 2px; }
+  /* Flat "app-window" UI. Single committed light theme, all colors explicit. */
+  :root {
+    --bg:#e9ebee; --win:#f7f8fa; --chrome:#33414d; --chrome-fg:#ffffff;
+    --ink:#1d2733; --muted:#7a8591; --line:#d3d8dd;
+    --accent:#2d7dd2; --accent-bg:#e5f0fb;
+    --btn:#eef1f4; --btn-hover:#e2e7ec; --panel:#eef1f4; --field:#ffffff;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--ink);
+    font-family:"Segoe UI", system-ui, -apple-system, sans-serif; font-size:13px; }
+  .window { max-width:1032px; margin:0 auto; background:var(--win); border:1px solid var(--line); }
+  .titlebar { display:flex; align-items:center; justify-content:space-between;
+    background:var(--chrome); color:var(--chrome-fg); padding:7px 10px; }
+  .titlebar .title { font-weight:600; letter-spacing:.3px; }
+  .winbtns { display:flex; gap:6px; }
+  .winbtns i { width:12px; height:12px; display:block; }
+  .winbtns .n { background:#4bb36a; } .winbtns .m { background:#e0a94b; } .winbtns .c { background:#e05b4b; }
+  .body { padding:12px 14px 16px; }
+  .statusbar { display:flex; flex-wrap:wrap; gap:6px 18px; padding:8px 12px;
+    background:var(--panel); border:1px solid var(--line); margin-bottom:12px; }
+  .section { margin-bottom:12px; }
+  .label { text-transform:uppercase; letter-spacing:1.2px; font-size:11px; color:var(--muted); margin-bottom:6px; }
+  .tiles { display:flex; flex-wrap:wrap; gap:8px; }
+  .tile { display:flex; flex-direction:column; align-items:center; justify-content:center;
+    width:100px; padding:9px 4px; background:var(--field); border:1px solid var(--line);
+    color:var(--ink); font:inherit; cursor:pointer; text-align:center; }
+  .tile:hover { background:var(--btn-hover); }
+  .tile.sel { border-color:var(--accent); background:var(--accent-bg); box-shadow:inset 0 0 0 1px var(--accent); }
+  .tile .ico { width:26px; height:26px; display:block; margin-bottom:6px; }
+  .row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .btn { font:inherit; padding:6px 12px; background:var(--btn); border:1px solid var(--line); color:var(--ink); cursor:pointer; }
+  .btn:hover { background:var(--btn-hover); }
+  .btn:disabled { color:#aab2ba; background:#f2f4f6; cursor:default; }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .btn.primary:hover { background:#2568b0; }
+  input[type=text], input[type=number] { font:inherit; padding:5px 7px; border:1px solid var(--line); background:var(--field); color:var(--ink); }
+  #eq { width:min(360px, 60vw); }
+  #pellets { width:54px; }
+  #cost { font-weight:700; color:var(--accent); }
+  #meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  #selpanel { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border:1px solid var(--line); }
+  #selinfo { flex:1 1 320px; }
+  .hint { color:var(--muted); font-size:12px; line-height:1.55; margin:10px 0; }
+  canvas { display:block; width:100%; max-width:1000px; height:auto; border:1px solid var(--line);
+    background:#fff; margin-top:6px; cursor:crosshair; touch-action:manipulation; }
+  #log { white-space:pre-wrap; color:#55606b; height:64px; overflow-y:auto; border:1px solid var(--line);
+    background:#fbfcfd; padding:6px 8px; margin-top:8px; font-size:12px; font-family:"Consolas", ui-monospace, monospace; }
+  code { background:#e7ebef; padding:1px 4px; font-family:"Consolas", ui-monospace, monospace; }
 </style>
 
-<div id="stats">
-  <span>Energy: <b id="s-energy">0</b></span>
-  <span>Base HP: <b id="s-hp">0</b></span>
-  <span>Wave: <b id="s-wave">0</b>/<b id="s-maxwave">0</b></span>
-  <span>Enemies: <b id="s-enemies">0</b></span>
-  <span>State: <b id="s-state">playing</b></span>
-  <span>Live Cost: <b id="cost">--</b></span>
-</div>
+<div class="window">
+  <div class="titlebar">
+    <span class="title">Graphwar Tower Defense</span>
+    <span class="winbtns"><i class="n"></i><i class="m"></i><i class="c"></i></span>
+  </div>
+  <div class="body">
 
-<div id="controls">
-  Type:
-  <button class="ttype sel" data-t="sniper">Sniper Pro</button>
-  <button class="ttype" data-t="bazooka">Bazooka Dude</button>
-  <button class="ttype" data-t="shotgun">Shotgun Guy</button>
-  <button class="ttype" data-t="subwoofer">Subwoofer DJ</button>
-  <button class="ttype" data-t="mirror">Mirror Mage</button>
-  <button class="ttype" data-t="mortar">Integral Mortar</button>
-  <button class="ttype" data-t="railgun">Derivative Railgun</button>
-  &nbsp;|&nbsp;
-  y = <input id="eq" type="text" value="0*x + 2" spellcheck="false">
-  pellets(N)= <input id="pellets" type="number" value="5" min="1" max="12">
-  <button id="place">Place Turret</button>
-  <button id="wave">Start Wave</button>
-  <button id="restart">Restart</button>
-</div>
+    <div class="statusbar">
+      <span>Energy <b id="s-energy">0</b></span>
+      <span>Base HP <b id="s-hp">0</b></span>
+      <span>Wave <b id="s-wave">0</b>/<b id="s-maxwave">0</b></span>
+      <span>Enemies <b id="s-enemies">0</b></span>
+      <span>State <b id="s-state">playing</b></span>
+      <span>Cost <b id="cost">--</b></span>
+    </div>
 
-<div id="selpanel">
-  <span id="selinfo">Selected: none — click a placed turret to select it.</span>
-  <button id="upgrade" disabled>Upgrade</button>
-  <button id="sell" disabled>Sell</button>
-</div>
+    <div class="section">
+      <div class="label">Tower Types</div>
+      <div class="tiles">
+        <button class="ttype tile sel" data-t="sniper"><span class="ico" style="background:#0a5"></span>Sniper Pro</button>
+        <button class="ttype tile" data-t="bazooka"><span class="ico" style="background:#a40"></span>Bazooka Dude</button>
+        <button class="ttype tile" data-t="shotgun"><span class="ico" style="background:#508"></span>Shotgun Guy</button>
+        <button class="ttype tile" data-t="subwoofer"><span class="ico" style="background:#059"></span>Subwoofer DJ</button>
+        <button class="ttype tile" data-t="mirror"><span class="ico" style="background:#c09"></span>Mirror Mage</button>
+        <button class="ttype tile" data-t="mortar"><span class="ico" style="background:#680"></span>Integral Mortar</button>
+        <button class="ttype tile" data-t="railgun"><span class="ico" style="background:#0aa"></span>Derivative Railgun</button>
+      </div>
+    </div>
 
-<div id="meta" class="hint">metadata: --</div>
-<div class="hint">
-  Placement: pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Bullets ride the curve <b>rightward</b>; place turrets LEFT of the incoming lane.
-  Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
-  Path speed (arc-length/sec): Railgun 20 (rides f'(x)) · Sniper 16 · Mirror 11 · Shotgun 9 · Bazooka 6.5 · Mortar 5 · Subwoofer 3.5.
-  <b>Curviness tax:</b> straight shots keep full damage; wavy paths (spamming sin) travel longer and hit softer. Splash towers exempt.
-  <b>Upgrades</b> change mechanics, not stats. Survive all waves to win.
-  Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
-</div>
+    <div class="section">
+      <div class="label">Equation &amp; Build</div>
+      <div class="row">
+        <span>y =</span>
+        <input id="eq" type="text" value="0*x + 2" spellcheck="false">
+        <span>pellets N</span>
+        <input id="pellets" type="number" value="5" min="1" max="12">
+        <button id="place" class="btn">Place Turret</button>
+        <button id="wave" class="btn primary">Start Wave</button>
+        <button id="restart" class="btn">Restart</button>
+      </div>
+      <div id="meta">metadata: --</div>
+    </div>
 
-<canvas id="cv" width="1000" height="600"></canvas>
-<div id="log"></div>
+    <div class="section">
+      <div class="label">Selected Turret</div>
+      <div id="selpanel">
+        <span id="selinfo">Selected: none — click a placed turret to select it.</span>
+        <button id="upgrade" class="btn" disabled>Upgrade</button>
+        <button id="sell" class="btn" disabled>Sell</button>
+      </div>
+    </div>
+
+    <div class="hint">
+      Pick a Type, type <code>y = f(x)</code>, click "Place Turret", then click the grid. Bullets ride the curve <b>rightward</b>; place turrets LEFT of the incoming lane.
+      Funcs: sin cos tan exp log(ln) abs sqrt floor ceil ^ pi e.
+      Path speed (arc-length/sec): Railgun 20 (rides f'(x)) · Sniper 16 · Mirror 11 · Shotgun 9 · Bazooka 6.5 · Mortar 5 · Subwoofer 3.5.
+      <b>Curviness tax:</b> straight shots keep full damage; wavy paths (spamming sin) travel longer and hit softer. Splash towers exempt.
+      <b>Upgrades</b> change mechanics, not stats. Survive all waves to win.
+      Enemies: <b>Tangent Crawler</b>=needs non-linear · <b>Root Bug</b>=hit only near y=0 · <b>Phase Shield</b>=needs sin/cos · <b>Exp Boss</b>=needs deg&gt;2 or exp/log/abs.
+    </div>
+
+    <canvas id="cv" width="1000" height="600"></canvas>
+    <div id="log"></div>
+
+  </div>
+</div>
 
 <script>
 "use strict";
